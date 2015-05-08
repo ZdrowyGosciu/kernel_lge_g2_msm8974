@@ -28,7 +28,9 @@
 #ifdef CONFIG_MAX17050_FUELGAUGE
 #include <linux/max17050_battery.h>
 #endif
+#ifdef CONFIG_MAX17048_FUELGAUGE
 #include <linux/max17048_battery.h>
+#endif
 #include <linux/qpnp/qpnp-adc.h>
 #include "../../arch/arm/mach-msm/smd_private.h"
 #include <linux/usb/otg.h>
@@ -755,6 +757,10 @@ static int smb349_get_prop_charge_type(struct smb349_struct *smb349_chg)
 		wake_lock_timeout(&smb349_chg->uevent_wake_lock, HZ*2);
 		if (status == SMB_CHG_STATUS_NONE) {
 			pr_debug("Charging stopped.\n");
+#ifdef CONFIG_BQ51053B_CHARGER
+			if(smb349_chg->wlc_present && (status_c & BIT(5)))
+				wireless_charging_completed();
+#endif
 			wake_unlock(&smb349_chg->chg_wake_lock);
 		} else {
 			pr_debug("Charging started.\n");
@@ -844,7 +850,7 @@ static int get_prop_batt_voltage_now_max17048(void)
 	voltage = max17048_get_voltage() * 1000;
 	return voltage;
 #else
-	pr_err("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
+	pr_debug("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
 	return DEFAULT_VOLTAGE;
 #endif
 }
@@ -1043,7 +1049,7 @@ static int get_prop_batt_capacity_max17048(struct smb349_struct *smb349_chg)
 #ifdef CONFIG_MAX17048_FUELGAUGE
 	return max17048_get_capacity();
 #else
-	pr_err("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
+	pr_debug("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
 	return DEFAULT_CAPACITY;
 #endif
 }
@@ -1131,7 +1137,7 @@ static int get_prop_batt_full_design_max17048(struct smb349_struct *smb349_chg)
 #ifdef CONFIG_MAX17048_FUELGAUGE
 	return max17048_get_fulldesign();
 #else
-	pr_err("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
+	pr_debug("CONFIG_MAX17048_FUELGAUGE is not defined.\n");
 	return DEFAULT_FULL_DESIGN;
 #endif
 }
@@ -2243,7 +2249,7 @@ static void smb349_bb_worker_trigger(struct smb349_struct *smb349_chg,
  */
 static void smb349_irq_worker(struct work_struct *work)
 {
-	u8 val;
+	u8 val = 0;
 	int ret = 0, usb_present = 0, host_mode;
 #if defined(CONFIG_BQ51053B_CHARGER) && defined(CONFIG_WIRELESS_CHARGER)
 	int wlc_present =0;
@@ -2279,7 +2285,7 @@ static void smb349_irq_worker(struct work_struct *work)
 	smb349_pr_info("[IRQ 35h~3Ah] A:0x%02X, B:0x%02X, C:0x%02X, D:0x%02X, E:0x%02X, F:0x%02X\n",
 		irqstat[0],irqstat[1], irqstat[2], irqstat[3], irqstat[4], irqstat[5]);
 #else
-	pr_info("[IRQ 35h~3Ah] A:0x%02X, B:0x%02X, C:0x%02X, D:0x%02X, E:0x%02X, F:0x%02X\n",
+	pr_err("[IRQ 35h~3Ah] A:0x%02X, B:0x%02X, C:0x%02X, D:0x%02X, E:0x%02X, F:0x%02X\n",
 		irqstat[0],irqstat[1], irqstat[2], irqstat[3], irqstat[4], irqstat[5]);
 #endif
 
@@ -2464,6 +2470,8 @@ static enum power_supply_property pm_power_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CHARGING_COMPLETE,
+	POWER_SUPPLY_PROP_SAFTETY_CHARGER_TIMER,
 };
 
 static enum power_supply_property smb349_batt_power_props[] = {
@@ -2483,7 +2491,6 @@ static enum power_supply_property smb349_batt_power_props[] = {
 	POWER_SUPPLY_PROP_PSEUDO_BATT,
 	POWER_SUPPLY_PROP_EXT_PWR_CHECK,
 #ifdef CONFIG_MAX17050_FUELGAUGE
-/*junnyoung.jang@lge.com 20130326 Add battery condition */
 	POWER_SUPPLY_PROP_BATTERY_CONDITION,
 	POWER_SUPPLY_PROP_BATTERY_AGE,
 #endif
@@ -2521,6 +2528,25 @@ static int pm_power_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = smb349_get_prop_charge_type(smb349_chg);
+		break;
+	case POWER_SUPPLY_PROP_SAFTETY_CHARGER_TIMER:
+	{
+		int ret;
+		u8 value = 0;
+		ret = smb349_read_reg(smb349_chg->client, STAT_TIMER_REG, &value);
+		if (ret) {
+			pr_err("failed to read STATUS_IRQ_REG ret=%d\n", ret);
+			return -EINVAL;
+		}
+		val->intval = ((value & COMPETE_CHG_TIMEOUT_BIT) == 0xc) ? false : true;
+		pr_info("get charger_timeout : %d[D]\n", val->intval);
+	}
+		break;
+	case POWER_SUPPLY_PROP_CHARGING_COMPLETE:
+		if (smb349_get_prop_batt_capacity(smb349_chg) == 100)
+			val->intval = 0;
+		else
+			val->intval = 1;
 		break;
 	default:
 		return -EINVAL;
@@ -2593,13 +2619,25 @@ static int smb349_chg_timeout_set(struct smb349_struct *smb349_chg)
 		return ret;
 	}
 
+	return 0;
+}
+
+static int smb349_chg_timer_set(struct smb349_struct *smb349_chg, bool enable)
+{
+	int ret;
+
+	pr_info("enable=%d\n", enable);
+
 	/* set Charge timeout bit */
-	ret = smb349_masked_write(smb349_chg->client, STATUS_IRQ_REG,
-				CHG_TIMEOUT_BIT, 0x80);
-	if (ret) {
-		pr_err("Failed to set CHG_TIMEOUT_BIT rc=%d\n", ret);
-		return ret;
-	}
+	if (!enable) {
+		ret = smb349_masked_write(smb349_chg->client, STAT_TIMER_REG,
+					COMPETE_CHG_TIMEOUT_BIT, 0xc);
+		if (ret) {
+			pr_err("Failed to set COMPETE_CHG_TIMEOUT_BIT rc=%d\n", ret);
+			return ret;
+		}
+	} else
+		smb349_chg_timeout_set(smb349_chg);
 
 	smb349_chg->chg_timeout = false;
 
@@ -2919,6 +2957,12 @@ static int smb349_hwinit(struct smb349_struct *smb349_chg)
 		return ret;
 	}
 
+	ret = smb349_chg_timer_set(smb349_chg, 1);
+	if (ret) {
+		pr_err("failed to enable chg safety timer\n");
+		return ret;
+	}
+
 	ret = smb349_chg_timeout_set(smb349_chg);
 	if (ret) {
 		pr_err("Failed to set CHG_TIMEOUT rc=%d\n", ret);
@@ -3204,7 +3248,10 @@ smb349_set_pre_chg_current(struct smb349_struct *smb349_chg, int pchg_ma)
 			PRE_CHG_CURRENT_MASK, temp);
 }
 
-#if defined(CONFIG_MACH_MSM8974_G2_ATT) || defined(CONFIG_MACH_MSM8974_G2_SPR) || defined(CONFIG_MACH_MSM8974_G2_VZW) || defined(CONFIG_MACH_MSM8974_G2_TMO_US) || defined(CONFIG_MACH_MSM8974_G2_TEL_AU) || defined(CONFIG_MACH_MSM8974_G2_OPEN_COM) || defined(CONFIG_MACH_MSM8974_G2_CA)
+#if defined(CONFIG_MACH_MSM8974_G2_ATT) || defined(CONFIG_MACH_MSM8974_G2_SPR) || \
+	defined(CONFIG_MACH_MSM8974_G2_VZW) || defined(CONFIG_MACH_MSM8974_G2_TMO_US) || \
+	defined(CONFIG_MACH_MSM8974_G2_TEL_AU) || defined(CONFIG_MACH_MSM8974_G2_OPEN_COM) || \
+	defined(CONFIG_MACH_MSM8974_G2_OPT_AU) || defined(CONFIG_MACH_MSM8974_G2_CA)
 #define HC_INPUT_CURR_LIMIT_DEFAULT 2000
 #else
 #define HC_INPUT_CURR_LIMIT_DEFAULT 3000
@@ -3699,7 +3746,6 @@ static int smb349_batt_power_get_property(struct power_supply *psy,
 		val->intval = lge_pm_get_cable_type();
 		break;
 #ifdef CONFIG_MAX17050_FUELGAUGE
-/*junnyoung.jang@lge.com 20130326 Add battery condition */
 	case POWER_SUPPLY_PROP_BATTERY_CONDITION:
 		val->intval = lge_pm_get_battery_condition();
 		break;
@@ -3857,6 +3903,10 @@ static int pm_power_set_property(struct power_supply *psy,
 		/* SMB329 does not use cable detect current */
 		//smb349_chg->chg_current_ma = val->intval;
 		break;
+	case POWER_SUPPLY_PROP_SAFTETY_CHARGER_TIMER:
+		smb349_chg_timer_set(smb349_chg, ((val->intval == 0) ? false : true));
+		pr_info("charger_timeout : %d[D]\n", val->intval);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -3872,6 +3922,7 @@ smb349_pm_power_property_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_PRESENT:
 	case POWER_SUPPLY_PROP_ONLINE:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_SAFTETY_CHARGER_TIMER:
 		return 1;
 	default:
 		break;
@@ -4423,6 +4474,8 @@ static int __devinit smb349_probe(struct i2c_client *client,
 		goto hwinit_fail;
 	}
 
+	the_smb349_chg = smb349_chg;
+
 	wake_lock_init(&smb349_chg->chg_wake_lock,
 		       WAKE_LOCK_SUSPEND, SMB349_NAME);
 	wake_lock_init(&smb349_chg->uevent_wake_lock,
@@ -4511,7 +4564,23 @@ static int __devinit smb349_probe(struct i2c_client *client,
 		goto reg_ac_psy_fail;
 	}
 
-	the_smb349_chg = smb349_chg;
+#if defined(CONFIG_LGE_PM_BATTERY_ID_CHECKER)
+	smem_batt = (uint *)smem_alloc(SMEM_BATT_INFO, sizeof(smem_batt));
+	if (smem_batt == NULL) {
+		pr_err("%s : smem_alloc returns NULL\n",__func__);
+		smb349_chg->batt_id_smem = 0;
+	} else {
+		pr_info("Battery was read in sbl is = %d\n", *smem_batt);
+
+		if (*smem_batt == BATT_ID_DS2704_L ||
+			*smem_batt == BATT_ID_DS2704_C ||
+			*smem_batt == BATT_ID_ISL6296_L ||
+			*smem_batt == BATT_ID_ISL6296_C)
+			smb349_chg->batt_id_smem = 1;
+		else
+			smb349_chg->batt_id_smem = 0;
+	}
+#endif
 
 	if (is_factory_cable()) {
 		if (is_factory_cable_130k()) {
@@ -4644,7 +4713,7 @@ reg_batt_psy_fail:
 #endif
 
 	wake_lock_destroy(&smb349_chg->chg_timeout_lock);
-
+	the_smb349_chg = NULL;
 hwinit_fail:
 no_dev_fail:
 #ifndef CONFIG_LGE_PM
@@ -4800,7 +4869,6 @@ static int smb349_suspend(struct device *dev)
 		cancel_delayed_work_sync(&smb349_chg->bb_rechg_work);
 	}
 #endif
-
 	return 0;
 }
 

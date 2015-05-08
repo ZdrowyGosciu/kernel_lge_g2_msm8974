@@ -40,9 +40,13 @@
 #define MAX_ACTUATOR_REGION 5
 #define MAX_ACTUATOR_INIT_SET 12
 #define MAX_ACTUATOR_REG_TBL_SIZE 8
+#define MAX_ACTUATOR_AF_TOTAL_STEPS 1024
 
 #define MOVE_NEAR 0
 #define MOVE_FAR  1
+
+#define MSM_ACTUATOR_MOVE_SIGNED_FAR -1
+#define MSM_ACTUATOR_MOVE_SIGNED_NEAR  1
 
 #define MAX_EEPROM_NAME 32
 
@@ -342,18 +346,19 @@ enum eeprom_cfg_type_t {
 	CFG_EEPROM_READ_CAL_DATA,
 	CFG_EEPROM_WRITE_DATA,
 };
+
 struct eeprom_get_t {
-	uint16_t num_bytes;
+	uint32_t num_bytes;
 };
 
 struct eeprom_read_t {
 	uint8_t *dbuffer;
-	uint16_t num_bytes;
+	uint32_t num_bytes;
 };
 
 struct eeprom_write_t {
 	uint8_t *dbuffer;
-	uint16_t num_bytes;
+	uint32_t num_bytes;
 };
 
 struct msm_eeprom_cfg_data {

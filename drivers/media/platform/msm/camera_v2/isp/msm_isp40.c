@@ -569,7 +569,7 @@ static long msm_vfe40_reset_hardware(struct vfe_device *vfe_dev)
 {
 	init_completion(&vfe_dev->reset_complete);
 	msm_camera_io_w_mb(0x1FF, vfe_dev->vfe_base + 0xC);
-	return wait_for_completion_interruptible_timeout(
+	return wait_for_completion_timeout(
 		&vfe_dev->reset_complete, msecs_to_jiffies(50));
 }
 
@@ -859,10 +859,8 @@ static void msm_vfe40_axi_cfg_wm_reg(
 		msm_camera_io_w(val, vfe_dev->vfe_base + wm_base + 0x14);
 
 		/*WR_BUFFER_CFG*/
-		val =
-			msm_isp_cal_word_per_line(stream_info->output_format,
-			stream_info->plane_cfg[
-				plane_idx].output_stride) << 16 |
+		val = (stream_info->plane_cfg[
+				plane_idx].output_stride/8) << 16 |
 			(stream_info->plane_cfg[
 				plane_idx].output_height - 1) << 4 |
 			VFE40_BURST_LEN;

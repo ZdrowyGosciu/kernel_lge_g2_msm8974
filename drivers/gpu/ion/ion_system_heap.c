@@ -59,13 +59,15 @@ struct ion_system_heap {
 
 struct page_info {
 	struct page *page;
+	bool from_pool;
 	unsigned int order;
 	struct list_head list;
 };
 
 static struct page *alloc_buffer_page(struct ion_system_heap *heap,
 				      struct ion_buffer *buffer,
-				      unsigned long order)
+				      unsigned long order,
+				      bool *from_pool)
 {
 	bool cached = ion_buffer_cached(buffer);
 	bool split_pages = ion_buffer_fault_user_mappings(buffer);
@@ -76,7 +78,7 @@ static struct page *alloc_buffer_page(struct ion_system_heap *heap,
 		pool = heap->uncached_pools[order_to_index(order)];
 	else
 		pool = heap->cached_pools[order_to_index(order)];
-	page = ion_page_pool_alloc(pool);
+	page = ion_page_pool_alloc(pool, from_pool);
 	if (!page)
 		return 0;
 
@@ -119,6 +121,11 @@ static struct page_info *alloc_largest_available(struct ion_system_heap *heap,
 	struct page *page;
 	struct page_info *info;
 	int i;
+	bool from_pool;
+
+	info = kmalloc(sizeof(struct page_info), GFP_KERNEL);
+	if (!info)
+		return NULL;
 
 	for (i = 0; i < num_orders; i++) {
 		if (size < order_to_size(orders[i]))
@@ -126,17 +133,18 @@ static struct page_info *alloc_largest_available(struct ion_system_heap *heap,
 		if (max_order < orders[i])
 			continue;
 
-		page = alloc_buffer_page(heap, buffer, orders[i]);
+		page = alloc_buffer_page(heap, buffer, orders[i], &from_pool);
 		if (!page)
 			continue;
 
-		info = kmalloc(sizeof(struct page_info), GFP_KERNEL);
-		if (info) {
-			info->page = page;
-			info->order = orders[i];
-		}
+		info->page = page;
+		info->order = orders[i];
+		info->from_pool = from_pool;
+		INIT_LIST_HEAD(&info->list);
 		return info;
 	}
+	kfree(info);
+
 	return NULL;
 }
 
@@ -157,6 +165,12 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 	unsigned long size_remaining = PAGE_ALIGN(size);
 	unsigned int max_order = orders[0];
 	bool split_pages = ion_buffer_fault_user_mappings(buffer);
+
+	if (align > PAGE_SIZE)
+		return -EINVAL;
+
+	if (size / PAGE_SIZE > totalram_pages / 2)
+		return -ENOMEM;
 
 	INIT_LIST_HEAD(&pages);
 	while (size_remaining > 0) {
@@ -369,8 +383,7 @@ static void ion_system_heap_destroy_pools(struct ion_page_pool **pools)
  * nothing. If it succeeds you'll eventually need to use
  * ion_system_heap_destroy_pools to destroy the pools.
  */
-static int ion_system_heap_create_pools(struct ion_page_pool **pools,
-					bool should_invalidate)
+static int ion_system_heap_create_pools(struct ion_page_pool **pools)
 {
 	int i;
 	for (i = 0; i < num_orders; i++) {
@@ -379,8 +392,7 @@ static int ion_system_heap_create_pools(struct ion_page_pool **pools,
 
 		if (orders[i] > 4)
 			gfp_flags = high_order_gfp_flags;
-		pool = ion_page_pool_create(gfp_flags, orders[i],
-					should_invalidate);
+		pool = ion_page_pool_create(gfp_flags, orders[i]);
 		if (!pool)
 			goto err_create_pool;
 		pools[i] = pool;
@@ -411,10 +423,10 @@ struct ion_heap *ion_system_heap_create(struct ion_platform_heap *unused)
 	if (!heap->cached_pools)
 		goto err_alloc_cached_pools;
 
-	if (ion_system_heap_create_pools(heap->uncached_pools, false))
+	if (ion_system_heap_create_pools(heap->uncached_pools))
 		goto err_create_uncached_pools;
 
-	if (ion_system_heap_create_pools(heap->cached_pools, true))
+	if (ion_system_heap_create_pools(heap->cached_pools))
 		goto err_create_cached_pools;
 
 	heap->heap.shrinker.shrink = ion_system_heap_shrink;
@@ -459,8 +471,12 @@ static int ion_system_contig_heap_allocate(struct ion_heap *heap,
 					   unsigned long align,
 					   unsigned long flags)
 {
+	int order = get_order(len);
 	int ret;
 	struct kmalloc_buffer_info *info;
+
+	if (align > (PAGE_SIZE << order))
+		return -EINVAL;
 
 	info = kmalloc(sizeof(struct kmalloc_buffer_info), GFP_KERNEL);
 	if (!info) {
